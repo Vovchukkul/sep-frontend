@@ -1,0 +1,213 @@
+# CircleCI needs variables:
+# AWS_DEFAULT_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, 
+# AWS_ACCOUNT_ID_PRODUCTION, AWS_ACCOUNT_ID_QA,
+# PROJECT_NAME,
+# SONAR_TOKEN
+
+version: 2.1
+orbs:
+  aws-cli: circleci/aws-cli@4.1.3
+  sonarcloud: sonarsource/sonarcloud@2.0.0
+
+executors:
+  terraform:
+    machine:
+        image: ubuntu-2204:2024.11.1
+  node:
+    docker:
+      - image: cimg/node:18.13.0
+
+jobs:
+
+  check_codebase_quality:
+    executor: node
+    resource_class: medium
+    steps:
+      - checkout
+      - run:
+          name: Install dependecies
+          command: |
+            npm install
+      - sonarcloud/scan
+
+  init_update_infrastructure:
+    executor: terraform
+    resource_class: medium
+    environment:
+      AWS_CONFIG_FILE: /home/circleci/project/config
+    steps:
+      - checkout # Pull code from GitHub repo
+      - aws-cli/setup:
+          profile_name: default
+      - configure_aws_credentials
+      - run:
+          name: Check AWS Infrastructure Changes
+          command: |
+            set -ex
+
+            # Get a list of existing environments
+            export existing_environments=$(aws ssm get-parameter --name "${PROJECT_NAME}-existing-environments-frontend" --with-decryption --query 'Parameter.Value' --output text)
+            
+            # Check whether the current environment exists in the list
+            if echo "$existing_environments" | grep -v -qw "${ENV}"; then
+              echo "This is a new environment called ${ENV}."
+              echo 'export new_environment=true' >> $BASH_ENV
+            else
+              echo "Environment ${ENV} already exists, cheching for updates"
+
+              #Check whether terraform files have any updates
+              if git diff --name-status HEAD^ HEAD | grep -q terraform; then
+                echo "The ${ENV} environment needs to be updated"
+                echo 'export update_infra=true' >> $BASH_ENV
+              else
+                echo "The ${ENV} environments has no updates"
+              fi
+            fi
+            
+      - run:
+          name: Initialize/Update AWS infrastructure
+          command: |
+            set -ex
+
+            # Execute Terraform commands if there's a new environment or updates
+            if [[ "$new_environment" == "true" || "$update_infra" == "true" ]]; then
+              # Install Terraform cli
+              wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+              echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+              sudo apt update && sudo apt install terraform=1.8.*
+
+              # Run Terraform Commands
+              cd .terraform_files/
+              terraform init
+              terraform workspace select -or-create=true ${ENV}
+              terraform plan -input=false -var-file=environments/${ENV}.tfvars 
+              terraform apply -auto-approve -var-file=environments/${ENV}.tfvars
+              cd ..
+            fi
+
+            # Append the new environment to the Parameter Store if it's a new environment
+            export existing_environments=$(aws ssm get-parameter --name "${PROJECT_NAME}-existing-environments-frontend" --with-decryption --query 'Parameter.Value' --output text)
+
+            if [[ "$new_environment" == "true" ]]; then
+              new_environments="$existing_environments${ENV},"
+              aws ssm put-parameter --name "${PROJECT_NAME}-existing-environments-frontend" --value "$new_environments" --type "String" --overwrite
+            fi
+
+
+  build_codebase:
+    executor: node
+    resource_class: medium
+    environment:
+      AWS_CONFIG_FILE: /home/circleci/project/config
+    steps:
+      - checkout
+      - aws-cli/setup:
+          profile_name: default
+      - configure_aws_credentials
+      - run:
+          name: Install dependecies
+          command: |
+            npm install
+      - run:
+          name: Pull environment variables 
+          command: |
+            set -ex
+
+            aws secretsmanager get-secret-value --profile ${ENV} --secret-id "${ENV}/${PROJECT_NAME}/frontend" --region $AWS_DEFAULT_REGION | jq -r '.SecretString' | \
+            jq -r "to_entries|map(\"\(.key)=\\\"\(.value|tostring)\\\"\")|.[]"| sed -e 's/"//' -e 's/"$//g' > .env || echo "No environment variables found"
+      - run:
+          name: Build codebase
+          command: |
+            set -ex
+
+            export $(cat .env | grep -v '#' | awk '/=/ {print $1}');
+            CI=false npm run build
+
+      - persist_to_workspace:
+          root: ./
+          paths:
+            - ./
+    
+  deploy_the_application:
+    executor: node
+    resource_class: small
+    environment:
+      AWS_CONFIG_FILE: /home/circleci/project/config
+    steps:
+      - attach_workspace:
+          at: ./
+      - configure_aws_credentials
+      - aws-cli/setup:
+          profile_name: default
+      - run:
+          name: Deploy codebase to AWS S3
+          command: |
+            set -ex           
+
+            # Get CloudFront Distribution ID
+            cloudfront_name=${ENV}-${PROJECT_NAME}-codebase
+            export AWS_CLOUD_FRONT_ID=$(aws cloudfront list-distributions --profile ${ENV} | jq --arg cfname "$cloudfront_name" '.DistributionList.Items[] | select(.DefaultCacheBehavior.TargetOriginId | test($cfname)) | .Id' | sed 's/"//g')
+            # Push codebase to the AWS S3 Bucket
+            [ -d "./dist" ] || exit 1
+            cd ./dist && aws s3 sync . s3://${ENV}-${PROJECT_NAME}-codebase --delete --profile ${ENV}
+            # Create CloudFront invalidation to clear cache
+            AWS_MAX_ATTEMPTS=10 aws cloudfront create-invalidation --profile ${ENV} --distribution-id "${AWS_CLOUD_FRONT_ID}" --paths "/*"
+            
+
+commands:
+  configure_aws_credentials:
+    steps:
+      - run:
+          name: Create AWS Config File
+          command: |
+            set -ex
+            if [[ "${CIRCLE_BRANCH}" = "production" ]]; then 
+              echo 'export account_id=$AWS_ACCOUNT_ID_PRODUCTION' >> $BASH_ENV
+            else
+              echo 'account_id=$AWS_ACCOUNT_ID_QA' >> $BASH_ENV
+            fi
+
+            if [[ "${CIRCLE_BRANCH}" = "production" || "${CIRCLE_BRANCH}" = "staging" || "${CIRCLE_BRANCH}" = "qa" ]]; then
+              echo 'export ENV=${CIRCLE_BRANCH}' >> $BASH_ENV
+            else
+              echo 'export ENV=qa' >> $BASH_ENV
+            fi
+      - run:
+          name: Create AWS Config File
+          command: |
+            
+            echo \
+            "[profile root]
+            aws_access_key_id=$AWS_ACCESS_KEY_ID
+            aws_secret_access_key=$AWS_SECRET_ACCESS_KEY
+            region=$AWS_DEFAULT_REGION
+            output=json
+          
+            [profile ${ENV}]
+            role_arn = arn:aws:iam::$account_id:role/${PROJECT_NAME}-terraform-frontend
+            source_profile = root
+            max_attempts = 10" > config
+
+
+workflows:
+  deploy:
+    jobs:
+      - init_update_infrastructure:
+          filters:
+            branches:
+              only:
+                - qa
+                - staging
+                - production
+      - check_codebase_quality
+      - build_codebase
+      - deploy_the_application:
+          requires:
+            - build_codebase
+            - init_update_infrastructure
+          filters:
+            branches:
+              only:
+                - qa
+                - staging
+                - production
