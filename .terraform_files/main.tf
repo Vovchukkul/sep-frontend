@@ -13,7 +13,7 @@ terraform {
 
 provider "aws" {
   shared_config_files = local.config_file
-  region              = "us-east-1" # Select the same region as above in backend "s3" block
+  region              = "us-east-2" # Select the same region as above in backend "s3" block
   profile             = "root"
   alias               = "root"
 }
