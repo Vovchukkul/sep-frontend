@@ -28,7 +28,6 @@ jobs:
           name: Install dependecies
           command: |
             npm install
-      - sonarcloud/scan
 
   init_update_infrastructure:
     executor: terraform
